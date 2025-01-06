@@ -37,9 +37,11 @@ fn main() {
         }
     };
 
-    for stream in listener.incoming() {
+    for stream in listener.incoming().take(2) {
         let stream = stream.unwrap();
 
         pool.execute(|| handle_connection(stream));
     }
+
+    println!("Shutting down.");
 }

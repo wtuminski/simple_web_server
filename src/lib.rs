@@ -4,6 +4,7 @@ use std::{
     thread::{self, JoinHandle},
 };
 
+#[derive(Debug)]
 pub enum PoolCreationError {
     ZeroThreadsToCreate,
 }
@@ -24,22 +25,29 @@ type Receiver = Arc<Mutex<mpsc::Receiver<Job>>>;
 
 struct Worker {
     id: usize,
-    thread: thread::JoinHandle<()>,
+    thread: Option<thread::JoinHandle<()>>,
 }
 
 fn build_thread(retry_count: u8, receiver: Receiver, thread_id: usize) -> JoinHandle<()> {
     let thread_builder = thread::Builder::new();
     let receiver_clone = Arc::clone(&receiver);
     match thread_builder.spawn(move || loop {
-        let job = receiver_clone
+        let message = receiver_clone
             .lock()
             .expect("Failed while locking a receiver.")
-            .recv()
-            .expect("Couldn't receive a job.");
+            .recv();
 
-        println!("Worker {thread_id} got a job; executing.");
-
-        job();
+        match message {
+            Ok(job) => {
+                println!("Worker {thread_id} got a job; executing.");
+                job();
+            }
+            Err(_) => {
+                // At this point probably sender was dropped
+                println!("Worker {thread_id} disconnected; shutting down.");
+                break;
+            }
+        }
     }) {
         Ok(handle) => handle,
         Err(_) => {
@@ -56,14 +64,14 @@ impl Worker {
     pub fn new(id: usize, receiver: Receiver) -> Worker {
         Worker {
             id,
-            thread: build_thread(0, receiver, id),
+            thread: Option::Some(build_thread(0, receiver, id)),
         }
     }
 }
 
 pub struct ThreadPool {
     workers: Vec<Worker>,
-    sender: mpsc::Sender<Job>,
+    sender: Option<mpsc::Sender<Job>>,
 }
 
 impl ThreadPool {
@@ -85,7 +93,10 @@ impl ThreadPool {
                 for id in 0..size {
                     workers.push(Worker::new(id, Arc::clone(&receiver)));
                 }
-                Ok(ThreadPool { workers, sender })
+                Ok(ThreadPool {
+                    workers,
+                    sender: Option::Some(sender),
+                })
             }
         }
     }
@@ -96,6 +107,71 @@ impl ThreadPool {
     {
         let job = Box::new(f);
 
-        self.sender.send(job).unwrap();
+        if let Some(sender) = &self.sender {
+            sender.send(job).expect("Failed to send to a job.");
+        };
+    }
+}
+
+impl Drop for ThreadPool {
+    fn drop(&mut self) {
+        drop(self.sender.take());
+
+        for worker in &mut self.workers {
+            println!("Shutting down worker {}", worker.id);
+            if let Some(thread) = worker.thread.take() {
+                thread
+                    .join()
+                    .expect(format!("Failed to join thread {}", worker.id).as_str());
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_pool_creation_error() {
+        let pool = ThreadPool::build(0);
+        assert_eq!(pool.is_err(), true);
+    }
+
+    #[test]
+    fn test_pool_creation() {
+        let pool = ThreadPool::build(4);
+        assert_eq!(pool.is_ok(), true);
+    }
+
+    #[test]
+    fn test_pool_execute() {
+        // given
+        let pool = ThreadPool::build(1).unwrap();
+        let some_value = Arc::new(Mutex::new(0));
+        let some_value_clone = Arc::clone(&some_value);
+        let is_done = Arc::new(Mutex::new(false));
+        let is_done_clone = Arc::clone(&is_done);
+
+        // when
+        pool.execute(move || {
+            println!("Executing a job.");
+            let mut locked_value = some_value.lock().unwrap();
+            *locked_value = 1;
+            *is_done.lock().unwrap() = true;
+        });
+        loop {
+            match is_done_clone.try_lock() {
+                Ok(is_done) => {
+                    if *is_done {
+                        break;
+                    }
+                }
+                Err(_) => {}
+            }
+        }
+
+        // then
+        assert_eq!(*some_value_clone.lock().unwrap(), 1);
     }
 }
